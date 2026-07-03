@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 import threading
+import re
 from datetime import datetime
 import requests
 from flask import Flask
@@ -27,25 +28,64 @@ PORT = int(os.environ.get('PORT', 10000))
 # ─── GEMINI ─────────────────────────────────────────────────────
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
 
-# Format a SMALL batch of shows (max ~10 episodes to stay under token limit)
-BATCH_PROMPT = """Format these TV show episodes into a clean list.
+GEMINI_PROMPT = """You are an expert data-formatting assistant. Your task is to transform a raw, unformatted list of TV show updates into a highly clean, engaging, numbered, and emoji-enhanced list.
 
-Rules:
-- Each show: "[Number]. [Emoji] [Show Name]"
-- Episodes: "Season XX, Episode XX - [Date]" (stacked, no blank lines between)
-- One blank line between different shows
-- NO header, NO footer - just the list
+Follow these strict formatting rules instructions explicitly:
 
-Input:
-{text}
+1. **Header:** Always start the response with exactly: "✨ Today's TV Show Updates ✨\n\n"
 
-Output:"""
+2. **Grouping & Condensing:** 
+   - If a TV show appears multiple times with different episodes (e.g., bulk season drops), group them under ONE single numbered entry.
+   - Do NOT repeat the show name or the number for multiple episodes of the same show.
 
-def format_batch(text_batch):
-    """Format one batch of shows via Gemini"""
+3. **Numbering & Show Titles:** 
+   - Format each unique show as: `[Number]. [Contextual Emoji] [Show Name]`
+   - Dynamically select an emoji that fits the theme or title of the show (e.g., 🩺/🏥 for medical, 🕵️‍♂️/🔍 for crime/mystery, 🐉 for dragons, 🚀 for space, etc.).
+
+4. **Episode Details:** 
+   - On the line below the show title (or stacked lines if multiple episodes), format the season and episode exactly like this: `Season XX, Episode XX - [Date]`
+   - Note: Change the original " - Season XX - Episode XX - " structure into "Season XX, Episode XX - " (using a comma instead of a dash between Season and Episode).
+
+5. **Spacing & Line Breaks:**
+   - Show Title to Episode: Do NOT insert a blank line between the show's title line and its first episode detail line.
+   - Multi-Episode Stacking: When grouping multiple episodes under a single show, stack the episode detail lines directly underneath each other with NO blank lines between them.
+   - Between Separate Entries: Insert exactly one single blank line between the last episode line of the current numbered entry and the title line of the next numbered entry.
+   - Header & Footer Margins: Ensure there is exactly one single blank line separating the header from entry #1, and exactly one single blank line separating the final entry from the footer message.
+
+6. **Footer:** Always end the output with exactly: "\nYou can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿"
+
+Here is an example input and your expected output:
+
+---
+
+INPUT:
+
+Today's Updates:
+
+Human Vapor - Season 01 - Episode 02 - [Jul 03, 2026]
+Human Vapor - Season 01 - Episode 01 - [Jul 03, 2026]
+
+OUTPUT:
+
+✨ Today's TV Show Updates ✨
+
+1. 💨 Human Vapor
+Season 01, Episode 02 - [Jul 03, 2026]
+Season 01, Episode 01 - [Jul 03, 2026]
+
+You can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿
+
+---
+
+Now format this input:
+
+{text}"""
+
+def format_with_gemini(text):
+    """Send text to Gemini, get formatted output."""
     try:
         r = requests.post(GEMINI_URL, json={
-            "contents": [{"parts": [{"text": BATCH_PROMPT.format(text=text_batch)}]}],
+            "contents": [{"parts": [{"text": GEMINI_PROMPT.format(text=text)}]}],
             "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
         }, timeout=30)
         r.raise_for_status()
@@ -53,113 +93,140 @@ def format_batch(text_batch):
         out = out.replace('```', '').strip()
         return out
     except Exception as e:
-        log.error(f"Batch format error: {e}")
-        # Fallback: basic formatting
-        lines = []
-        for line in text_batch.strip().split('\n'):
-            if line.strip():
-                # Simple transform: "Show - Season X - Episode Y - [Date]" → "Show\nSeason X, Episode Y - [Date]"
-                parts = line.split(' - Season ')
-                if len(parts) == 2:
-                    show = parts[0].strip()
-                    rest = 'Season ' + parts[1].replace(' - Episode ', ', Episode ')
-                    lines.append(f"• {show}\n{rest}")
-                else:
-                    lines.append(line)
-        return '\n\n'.join(lines)
+        log.error(f"Gemini error: {e}")
+        return None
 
+# ─── PARSER ─────────────────────────────────────────────────────
+def parse_episodes(text):
+    """Parse raw text into structured episodes."""
+    episodes = []
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if not line or 'Season' not in line or 'Episode' not in line:
+            continue
+        match = re.search(r'(.*?)\s+-\s+Season\s+(\d+)\s+-\s+Episode\s+(\d+)\s+-\s+(\[.*?\])', line)
+        if match:
+            episodes.append({
+                'show': match.group(1).strip(),
+                'season': match.group(2).strip(),
+                'episode': match.group(3).strip(),
+                'date': match.group(4).strip()
+            })
+    return episodes
+
+# ─── SPLIT & FORMAT ─────────────────────────────────────────────
 def rewrite(text):
-    """Split long lists into batches, format each, combine"""
+    """Split into batches, format each with Gemini, combine."""
     if not text or not text.strip():
         return "🎬 New update!"
     
-    # Parse lines
-    lines = [l.strip() for l in text.strip().split('\n') if l.strip() and 'Season' in l]
-    
-    if not lines:
+    episodes = parse_episodes(text)
+    if not episodes:
         return "🎬 New update!"
     
-    # Group by show name
+    # Group by show
     shows = {}
-    for line in lines:
-        # Extract show name (everything before " - Season")
-        show_name = line.split(' - Season ')[0].strip()
-        if show_name not in shows:
-            shows[show_name] = []
-        # Transform: " - Season XX - Episode YY - [Date]" → "Season XX, Episode YY - [Date]"
-        ep_part = line.split(' - Season ', 1)[1]
-        ep_formatted = 'Season ' + ep_part.replace(' - Episode ', ', Episode ')
-        shows[show_name].append(ep_formatted)
+    show_order = []
+    for ep in episodes:
+        show = ep['show']
+        if show not in shows:
+            shows[show] = []
+            show_order.append(show)
+        shows[show].append(ep)
     
-    # Build batches (max 8 shows per batch to stay under token limit)
-    show_items = list(shows.items())
+    # Sort episodes within each show
+    for show in shows:
+        shows[show].sort(key=lambda x: (int(x['season']), int(x['episode'])))
+    
+    # Split shows into batches of max 8 shows (to stay under token limit)
     batches = []
     current_batch = []
-    current_count = 0
+    current_weight = 0
     
-    for show_name, episodes in show_items:
-        # Each show with many episodes counts as more
-        weight = 1 + (len(episodes) // 5)
-        if current_count + weight > 8 and current_batch:
+    for show in show_order:
+        # Weight = 1 + episodes//5 (more episodes = more tokens)
+        weight = 1 + (len(shows[show]) // 5)
+        if current_weight + weight > 8 and current_batch:
             batches.append(current_batch)
             current_batch = []
-            current_count = 0
-        current_batch.append((show_name, episodes))
-        current_count += weight
+            current_weight = 0
+        current_batch.append(show)
+        current_weight += weight
     
     if current_batch:
         batches.append(current_batch)
     
-    log.info(f"Split into {len(batches)} batches")
+    log.info(f"Split into {len(batches)} batches for Gemini")
     
     # Format each batch
     formatted_parts = []
     for i, batch in enumerate(batches):
         # Build input text for this batch
-        batch_text = "Today's Updates:\n\n"
-        for show_name, episodes in batch:
-            batch_text += f"{show_name} - " + " / ".join(episodes) + "\n"
+        batch_lines = ["Today's Updates:", ""]
+        for show in batch:
+            for ep in shows[show]:
+                batch_lines.append(f"{show} - Season {ep['season']} - Episode {ep['episode']} - {ep['date']}")
         
-        log.info(f"Formatting batch {i+1}/{len(batches)}...")
-        formatted = format_batch(batch_text)
-        formatted_parts.append(formatted)
+        batch_text = '\n'.join(batch_lines)
+        log.info(f"Formatting batch {i+1}/{len(batches)} ({len(batch)} shows)...")
+        
+        result = format_with_gemini(batch_text)
+        if result:
+            # Strip header/footer from middle batches
+            lines = result.split('\n')
+            # Remove header
+            while lines and ('✨' in lines[0] or lines[0].strip() == ''):
+                lines.pop(0)
+            # Remove footer
+            while lines and ('download' in lines[-1].lower() or 'enjoy' in lines[-1].lower() or lines[-1].strip() == ''):
+                lines.pop()
+            
+            formatted_parts.append('\n'.join(lines))
+        else:
+            # Fallback: basic format
+            fallback = []
+            for show in batch:
+                fallback.append(f"📺 {show}")
+                for ep in shows[show]:
+                    fallback.append(f"Season {ep['season']}, Episode {ep['episode']} - {ep['date']}")
+                fallback.append("")
+            formatted_parts.append('\n'.join(fallback))
     
-    # Combine all parts
-    full_output = "✨ Today\'s TV Show Updates ✨\n\n"
+    # Combine all parts with proper numbering
+    final_lines = ["✨ Today's TV Show Updates ✨", ""]
     
-    # Renumber across all batches
     number = 1
-    final_lines = []
-    
     for part in formatted_parts:
         for line in part.split('\n'):
-            # Detect show title lines (start with number or bullet)
-            stripped = line.strip()
-            if stripped and (stripped[0].isdigit() or stripped.startswith('•') or stripped.startswith('-')):
-                # Extract show name after emoji or bullet
-                if '.' in stripped and stripped[0].isdigit():
-                    # Remove old number, add new
-                    show_part = stripped.split('.', 1)[1].strip()
-                elif stripped.startswith('•') or stripped.startswith('-'):
-                    show_part = stripped[1:].strip()
-                else:
-                    show_part = stripped
-                
-                # Add emoji if missing
-                if not any(ord(c) > 0x1F300 for c in show_part[:3]):
-                    show_part = "📺 " + show_part
-                
-                final_lines.append(f"{number}. {show_part}")
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Detect show title line (starts with number or has emoji)
+            match = re.match(r'(\d+)\.\s+(\S+)\s+(.*)', line)
+            if match:
+                # Replace old number with sequential number
+                emoji = match.group(2)
+                name = match.group(3)
+                final_lines.append(f"{number}. {emoji} {name}")
                 number += 1
-            elif stripped.startswith('Season'):
-                final_lines.append(stripped)
-            elif stripped == '':
-                final_lines.append('')
+            elif line.startswith('Season'):
+                final_lines.append(line)
+            elif any(ord(c) > 0x1F300 for c in line[:5]):
+                # Line starts with emoji but no number
+                final_lines.append(f"{number}. {line}")
+                number += 1
+        
+        final_lines.append("")  # blank line between batches
     
-    full_output += '\n'.join(final_lines)
-    full_output += "\n\nYou can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿"
+    # Clean up
+    while final_lines and final_lines[-1] == "":
+        final_lines.pop()
     
-    return full_output
+    final_lines.append("")
+    final_lines.append("You can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿")
+    
+    return '\n'.join(final_lines)
 
 # ─── GIST STATE ─────────────────────────────────────────────────
 GIST_API = "https://api.github.com/gists"
