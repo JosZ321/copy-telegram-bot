@@ -2,10 +2,12 @@ import os
 import json
 import asyncio
 import logging
-from aiohttp import web
+import threading
+from datetime import datetime
+import requests
+from flask import Flask
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 log = logging.getLogger()
@@ -20,18 +22,22 @@ DEST = os.environ.get('DEST_CHANNEL', 'NewmovieandSeries0')
 PORT = int(os.environ.get('PORT', 10000))
 STATE_PREFIX = "__BOTSTATE__:"
 
-# ─── GEMINI ─────────────────────────────────────────────────────
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# ─── GEMINI (Direct HTTP - no heavy SDK) ────────────────────────
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
 
 def rewrite(text):
     if not text or not text.strip():
         return "🎬 New update!"
+    
+    prompt = f"Rewrite with emojis, keep all info, no intro, under 1000 chars:\n\n{text}\n\nRewritten:"
+    
     try:
-        r = model.generate_content(
-            f"Rewrite with emojis, keep all info, no intro, under 1000 chars:\n\n{text}\n\nRewritten:"
-        )
-        out = r.text.strip().replace('```', '')
+        r = requests.post(GEMINI_URL, json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}
+        }, timeout=30)
+        r.raise_for_status()
+        out = r.json()['candidates'][0]['content']['parts'][0]['text'].strip().replace('```', '')
         if not any(ord(c) > 0x1F300 for c in out):
             out = "🎬 " + out
         return out[:4096]
@@ -39,7 +45,7 @@ def rewrite(text):
         log.error(f"Gemini error: {e}")
         return f"🎬 {text[:4000]}"
 
-# ─── STATE (Saved in your own Telegram "Saved Messages") ───────
+# ─── STATE (Saved in your Telegram "Saved Messages") ────────────
 async def load_state(client):
     msgs = await client.get_messages('me', search=STATE_PREFIX, limit=1)
     if msgs:
@@ -47,10 +53,9 @@ async def load_state(client):
             return json.loads(msgs[0].text.split(STATE_PREFIX, 1)[1])
         except:
             pass
-    # First run ever: skip old messages, start from now
     latest = await client.get_messages(SOURCE, limit=1)
     if latest:
-        log.info(f"No state found. Starting from latest message #{latest[0].id}")
+        log.info(f"No state. Starting from latest message #{latest[0].id}")
         return {'last': latest[0].id, 'total': 0}
     return {'last': 0, 'total': 0}
 
@@ -63,7 +68,7 @@ async def save_state(client, state):
 # ─── BOT RUN ────────────────────────────────────────────────────
 bot_running = False
 
-async def run_bot():
+async def run_bot_once():
     global bot_running
     if bot_running:
         return "Already running"
@@ -92,7 +97,7 @@ async def run_bot():
         if msg.id <= last:
             continue
         text = msg.text or msg.raw_text or ""
-        log.info(f"Copying #{msg.id}: {text[:50]}...")
+        log.info(f"[{copied+1}/{len(msgs)}] #{msg.id}: {text[:50]}...")
         
         new_text = rewrite(text) if text else "🎬 New update!"
         try:
@@ -119,30 +124,24 @@ async def run_bot():
     log.info("Done")
     return f"Copied {copied} messages"
 
-# ─── WEB SERVER (UptimeRobot pings this to keep us awake) ─────
-async def health(request):
-    try:
-        result = await run_bot()
-        return web.Response(text=f"OK - {result}")
-    except Exception as e:
-        log.error(f"Error: {e}")
-        return web.Response(text=f"Error: {e}", status=500)
+# ─── FLASK WEB SERVER (UptimeRobot pings this) ─────────────────
+app = Flask(__name__)
 
-async def main():
-    app = web.Application()
-    app.router.add_get('/health', health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    log.info(f"Server running on port {PORT}")
-    
-    # Run once immediately on startup
-    await run_bot()
-    
-    # Keep alive forever
-    while True:
-        await asyncio.sleep(3600)
+@app.route('/health')
+def health():
+    # Run bot in background thread so HTTP responds fast
+    def background():
+        asyncio.run(run_bot_once())
+    threading.Thread(target=background).start()
+    return {"status": "ok", "time": datetime.now().isoformat()}
 
+@app.route('/')
+def home():
+    return {"bot": "telegram-channel-bot", "status": "running"}
+
+# ─── MAIN ───────────────────────────────────────────────────────
 if __name__ == '__main__':
-    asyncio.run(main())
+    # Run once immediately
+    asyncio.run(run_bot_once())
+    # Start web server (UptimeRobot keeps this alive)
+    app.run(host='0.0.0.0', port=PORT)
