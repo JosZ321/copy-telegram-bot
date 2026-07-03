@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 import re
+import time
 from datetime import datetime
 import requests
 from flask import Flask
@@ -25,8 +26,9 @@ SOURCE = os.environ.get('SOURCE_CHANNEL', 'o2tvseries_new')
 DEST = os.environ.get('DEST_CHANNEL', 'NewmovieandSeries0')
 PORT = int(os.environ.get('PORT', 10000))
 
-# ─── GEMINI ─────────────────────────────────────────────────────
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+# ─── GEMINI SETUP ───────────────────────────────────────────────
+GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"]
 
 GEMINI_PROMPT = """You are an expert data-formatting assistant. Your task is to transform a raw, unformatted list of TV show updates into a highly clean, engaging, numbered, and emoji-enhanced list.
 
@@ -82,42 +84,152 @@ Now format this input:
 {text}"""
 
 def format_with_gemini(text):
-    """Send text to Gemini, get formatted output."""
-    try:
-        r = requests.post(GEMINI_URL, json={
-            "contents": [{"parts": [{"text": GEMINI_PROMPT.format(text=text)}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
-        }, timeout=30)
-        r.raise_for_status()
-        
-        data = r.json()
-        # Debug: log the structure
-        log.info(f"Gemini response keys: {list(data.keys())}")
-        
-        # Handle different response structures
-        candidates = data.get('candidates', [])
-        if not candidates:
-            log.error("No candidates in Gemini response")
-            return None
-        
-        content = candidates[0].get('content', {})
-        if isinstance(content, dict):
-            parts = content.get('parts', [])
+    """Try multiple Gemini models, return formatted text or None."""
+    payload = {
+        "contents": [{"parts": [{"text": GEMINI_PROMPT.format(text=text)}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
+    }
+    
+    for model in GEMINI_MODELS:
+        url = GEMINI_URL_TEMPLATE.format(model=model, key=GEMINI_KEY)
+        try:
+            log.info(f"Trying {model}...")
+            r = requests.post(url, json=payload, timeout=30)
+            r.raise_for_status()
+            
+            data = r.json()
+            candidates = data.get('candidates', [])
+            if not candidates:
+                continue
+            
+            content = candidates[0].get('content', {})
+            parts = content.get('parts', []) if isinstance(content, dict) else []
+            
             if parts and isinstance(parts[0], dict):
                 out = parts[0].get('text', '').strip()
             else:
                 out = str(parts[0]).strip() if parts else ''
-        else:
-            out = str(content).strip()
-        
-        out = out.replace('```', '').strip()
-        return out
-        
-    except Exception as e:
-        log.error(f"Gemini error: {e}")
-        import traceback
-        log.error(traceback.format_exc())
-        return None
+            
+            if out:
+                out = out.replace('```', '').strip()
+                log.info(f"✅ {model} worked")
+                return out
+                
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code
+            if status == 503:
+                log.warning(f"{model} unavailable (503)")
+                continue
+            if status == 429:
+                log.warning(f"{model} rate limited, waiting...")
+                time.sleep(5)
+                continue
+            log.error(f"{model} HTTP {status}")
+            return None
+        except Exception as e:
+            log.error(f"{model} error: {e}")
+            continue
+    
+    log.error("All Gemini models failed")
+    return None
+
+# ─── SMART EMOJI FINDER ─────────────────────────────────────────
+def get_smart_emoji(show_name):
+    """Find best emoji for a show name."""
+    sl = show_name.lower()
+    
+    # Exact matches first
+    exact = {
+        'avatar - the last airbender': '🌊',
+        'the bear': '🐻',
+        'love island': '💕',
+        'love island us': '💕',
+        'welcome to wrexham': '⚽',
+        'camp snoopy': '🏕️',
+        'ninja to gokudou': '🥷',
+        'power book iii - raising kanan': '👑',
+        'fist of the north star - hokuto no ken': '👊',
+        'star city': '⭐',
+        'jupiter jones': '🪐',
+        'beyond the gates': '🚪',
+        'brilliant minds': '🧠',
+        'cape fear': '🦈',
+        'the chi': '🏙️',
+        'petals of reincarnation': '🌸',
+        'human vapor': '💨',
+        'the doomies': '💀',
+        'ravalear': '🐉',
+        'notes from the last row': '🎵',
+        'snowball earth': '❄️',
+        'the ramparts of ice': '🏰',
+        'proud': '🏆',
+        'dutton ranch': '🤠',
+        'agent kim reactivated': '🕵️',
+        'life larry and the pursuit of unhappiness': '😔',
+        'chainsmoker cat': '🐱',
+        'de tattas - de serie': '🇳🇱',
+        'sugar': '🍬',
+        'silo': '🌾',
+    }
+    
+    for name, emoji in exact.items():
+        if name in sl:
+            return emoji
+    
+    # Keyword matching
+    keywords = [
+        (['dragon', 'fantasy', 'magic', 'witch', 'demon', 'vampire', 'werewolf'], '🐉'),
+        (['medical', 'hospital', 'doctor', 'nurse', 'patient', 'surgeon', 'emergency'], '🩺'),
+        (['crime', 'detective', 'murder', 'police', 'fbi', 'cia', 'investigation', 'serial killer'], '🔍'),
+        (['space', 'star', 'alien', 'mars', 'planet', 'galaxy', 'cosmos', 'astronaut'], '🚀'),
+        (['war', 'battle', 'soldier', 'army', 'navy', 'marine', 'combat', 'warrior', 'king', 'queen', 'throne'], '⚔️'),
+        (['comedy', 'funny', 'laugh', 'sitcom', 'humor'], '😂'),
+        (['horror', 'scary', 'ghost', 'zombie', 'haunted', 'evil', 'devil'], '👻'),
+        (['ice', 'snow', 'cold', 'winter', 'frozen', 'arctic', 'antarctica'], '❄️'),
+        (['doom', 'dark', 'death', 'apocalypse', 'end of world', 'dystopia'], '💀'),
+        (['agent', 'spy', 'secret', 'mission', 'intelligence', 'covert'], '🕵️'),
+        (['fight', 'martial', 'karate', 'kung', 'boxing', 'mma', 'ufc'], '👊'),
+        (['ranch', 'cowboy', 'west', 'horse', 'frontier', 'outlaw'], '🤠'),
+        (['gate', 'portal', 'dimension', 'parallel', 'time travel'], '🚪'),
+        (['music', 'song', 'band', 'concert', 'singer', 'album', 'rap', 'hip hop'], '🎵'),
+        (['life', 'happiness', 'pursuit', 'reincarnation', 'afterlife', 'rebirth'], '🌟'),
+        (['earth', 'world', 'globe', 'nature', 'environment', 'climate'], '🌍'),
+        (['proud', 'pride', 'honor', 'glory', 'champion', 'victory'], '🏆'),
+        (['city', 'urban', 'metro', 'downtown', 'street', 'gang'], '🏙️'),
+        (['castle', 'fortress', 'rampart', 'kingdom', 'empire', 'medieval'], '🏰'),
+        (['ninja', 'samurai', 'japan', 'shogun', 'ronin', 'dojo'], '🥷'),
+        (['cat', 'kitten', 'feline', 'meow', 'purr'], '🐱'),
+        (['dog', 'puppy', 'canine', 'woof', 'bark'], '🐶'),
+        (['family', 'parent', 'child', 'kids', 'mother', 'father'], '👨‍👩‍👧‍👦'),
+        (['food', 'cook', 'chef', 'restaurant', 'kitchen', 'recipe'], '🍳'),
+        (['sport', 'football', 'soccer', 'basketball', 'baseball', 'team'], '⚽'),
+        (['school', 'student', 'teacher', 'class', 'university', 'college'], '🎓'),
+        (['money', 'rich', 'wealth', 'billionaire', 'business', 'corporate'], '💰'),
+        (['car', 'drive', 'race', 'motor', 'speed', 'highway'], '🏎️'),
+        (['plane', 'fly', 'airport', 'pilot', 'flight', 'travel'], '✈️'),
+        (['boat', 'ship', 'sea', 'ocean', 'sail', 'cruise', 'navy'], '⚓'),
+        (['robot', 'ai', 'cyborg', 'android', 'machine', 'future', 'tech'], '🤖'),
+        (['superhero', 'hero', 'villain', 'comic', 'marvel', 'dc', 'powers'], '🦸'),
+        (['prison', 'jail', 'convict', 'escape', 'heist', 'robbery'], '⛓️'),
+        (['court', 'lawyer', 'judge', 'trial', 'justice', 'legal'], '⚖️'),
+        (['politics', 'president', 'government', 'election', 'white house'], '🏛️'),
+        (['religion', 'god', 'church', 'faith', 'bible', 'priest'], '⛪'),
+        (['alien', 'ufo', 'extraterrestrial', 'mars', 'area 51'], '👽'),
+        (['dinosaur', 'jurassic', 'prehistoric', 'trex', 'raptor'], '🦖'),
+        (['pirate', 'treasure', 'caribbean', 'captain', 'ship'], '☠️'),
+        (['viking', 'norse', 'odin', 'thor', 'valhalla', 'ragnarok'], '🪓'),
+        (['zombie', 'undead', 'infection', 'virus', 'outbreak'], '🧟'),
+        (['angel', 'heaven', 'guardian', 'wings', 'divine'], '👼'),
+        (['devil', 'hell', 'demon', 'satan', 'possession'], '😈'),
+        (['circus', 'clown', 'carnival', 'freak', 'performance'], '🎪'),
+        (['circus', 'clown', 'carnival', 'freak', 'performance'], '🎪'),
+    ]
+    
+    for words, emoji in keywords:
+        if any(w in sl for w in words):
+            return emoji
+    
+    return '📺'
 
 # ─── PARSER ─────────────────────────────────────────────────────
 def parse_episodes(text):
@@ -137,9 +249,32 @@ def parse_episodes(text):
             })
     return episodes
 
-# ─── SPLIT & FORMAT ─────────────────────────────────────────────
+# ─── PYTHON FALLBACK FORMATTER ─────────────────────────────────
+def python_format(shows, show_order):
+    """Format shows using Python (no Gemini needed). Smart emojis included."""
+    lines = ["✨ Today's TV Show Updates ✨", ""]
+    
+    for i, show in enumerate(show_order, 1):
+        emoji = get_smart_emoji(show)
+        lines.append(f"{i}. {emoji} {show}")
+        
+        for ep in shows[show]:
+            lines.append(f"Season {ep['season']}, Episode {ep['episode']} - {ep['date']}")
+        
+        lines.append("")
+    
+    # Remove trailing blank
+    if lines and lines[-1] == "":
+        lines.pop()
+    
+    lines.append("")
+    lines.append("You can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿")
+    
+    return '\n'.join(lines)
+
+# ─── MAIN REWRITE ───────────────────────────────────────────────
 def rewrite(text):
-    """Split into batches, format each with Gemini, combine."""
+    """Format TV show list. Try Gemini first, fallback to Python."""
     if not text or not text.strip():
         return "🎬 New update!"
     
@@ -161,95 +296,24 @@ def rewrite(text):
     for show in shows:
         shows[show].sort(key=lambda x: (int(x['season']), int(x['episode'])))
     
-    # Split shows into batches of max 8 shows (to stay under token limit)
-    batches = []
-    current_batch = []
-    current_weight = 0
-    
-    for show in show_order:
-        # Weight = 1 + episodes//5 (more episodes = more tokens)
-        weight = 1 + (len(shows[show]) // 5)
-        if current_weight + weight > 8 and current_batch:
-            batches.append(current_batch)
-            current_batch = []
-            current_weight = 0
-        current_batch.append(show)
-        current_weight += weight
-    
-    if current_batch:
-        batches.append(current_batch)
-    
-    log.info(f"Split into {len(batches)} batches for Gemini")
-    
-    # Format each batch
-    formatted_parts = []
-    for i, batch in enumerate(batches):
-        # Build input text for this batch
-        batch_lines = ["Today's Updates:", ""]
-        for show in batch:
+    # Try Gemini first (for best emojis and formatting)
+    # Only use Gemini for small lists (under 15 shows) to avoid token limits
+    if len(show_order) <= 15:
+        # Build full input
+        input_lines = ["Today's Updates:", ""]
+        for show in show_order:
             for ep in shows[show]:
-                batch_lines.append(f"{show} - Season {ep['season']} - Episode {ep['episode']} - {ep['date']}")
+                input_lines.append(f"{show} - Season {ep['season']} - Episode {ep['episode']} - {ep['date']}")
         
-        batch_text = '\n'.join(batch_lines)
-        log.info(f"Formatting batch {i+1}/{len(batches)} ({len(batch)} shows)...")
+        gemini_result = format_with_gemini('\n'.join(input_lines))
         
-        result = format_with_gemini(batch_text)
-        if result:
-            # Strip header/footer from middle batches
-            lines = result.split('\n')
-            # Remove header
-            while lines and ('✨' in lines[0] or lines[0].strip() == ''):
-                lines.pop(0)
-            # Remove footer
-            while lines and ('download' in lines[-1].lower() or 'enjoy' in lines[-1].lower() or lines[-1].strip() == ''):
-                lines.pop()
-            
-            formatted_parts.append('\n'.join(lines))
-        else:
-            # Fallback: basic format
-            fallback = []
-            for show in batch:
-                fallback.append(f"📺 {show}")
-                for ep in shows[show]:
-                    fallback.append(f"Season {ep['season']}, Episode {ep['episode']} - {ep['date']}")
-                fallback.append("")
-            formatted_parts.append('\n'.join(fallback))
+        if gemini_result:
+            log.info("✅ Used Gemini formatting")
+            return gemini_result
     
-    # Combine all parts with proper numbering
-    final_lines = ["✨ Today's TV Show Updates ✨", ""]
-    
-    number = 1
-    for part in formatted_parts:
-        for line in part.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Detect show title line (starts with number or has emoji)
-            match = re.match(r'(\d+)\.\s+(\S+)\s+(.*)', line)
-            if match:
-                # Replace old number with sequential number
-                emoji = match.group(2)
-                name = match.group(3)
-                final_lines.append(f"{number}. {emoji} {name}")
-                number += 1
-            elif line.startswith('Season'):
-                final_lines.append(line)
-            elif any(ord(c) > 0x1F300 for c in line[:5]):
-                # Line starts with emoji but no number
-                final_lines.append(f"{number}. {line}")
-                number += 1
-        
-        final_lines.append("")  # blank line between batches
-    
-    # Clean up
-    while final_lines and final_lines[-1] == "":
-        final_lines.pop()
-    
-    final_lines.append("")
-    final_lines.append("You can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿")
-    
-    return '\n'.join(final_lines)
+    # Fallback: Python formatting with smart emojis
+    log.info("Using Python fallback with smart emojis")
+    return python_format(shows, show_order)
 
 # ─── GIST STATE ─────────────────────────────────────────────────
 GIST_API = "https://api.github.com/gists"
