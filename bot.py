@@ -24,7 +24,7 @@ PORT = int(os.environ.get('PORT', 10000))
 STATE_PREFIX = "__BOTSTATE__:"
 
 # ─── GEMINI ─────────────────────────────────────────────────────
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
 
 def rewrite(text):
     if not text or not text.strip():
