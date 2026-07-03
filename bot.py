@@ -89,11 +89,34 @@ def format_with_gemini(text):
             "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
         }, timeout=30)
         r.raise_for_status()
-        out = r.json()['candidates'][0]['content']['parts'][0].text.strip()
+        
+        data = r.json()
+        # Debug: log the structure
+        log.info(f"Gemini response keys: {list(data.keys())}")
+        
+        # Handle different response structures
+        candidates = data.get('candidates', [])
+        if not candidates:
+            log.error("No candidates in Gemini response")
+            return None
+        
+        content = candidates[0].get('content', {})
+        if isinstance(content, dict):
+            parts = content.get('parts', [])
+            if parts and isinstance(parts[0], dict):
+                out = parts[0].get('text', '').strip()
+            else:
+                out = str(parts[0]).strip() if parts else ''
+        else:
+            out = str(content).strip()
+        
         out = out.replace('```', '').strip()
         return out
+        
     except Exception as e:
         log.error(f"Gemini error: {e}")
+        import traceback
+        log.error(traceback.format_exc())
         return None
 
 # ─── PARSER ─────────────────────────────────────────────────────
