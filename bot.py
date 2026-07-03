@@ -27,18 +27,71 @@ PORT = int(os.environ.get('PORT', 10000))
 # ─── GEMINI ─────────────────────────────────────────────────────
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
 
+GEMINI_PROMPT = """You are an expert data-formatting assistant. Your task is to transform a raw, unformatted list of TV show updates into a highly clean, engaging, numbered, and emoji-enhanced list.
+
+Follow these strict formatting rules instructions explicitly:
+
+1. **Header:** Always start the response with exactly: "✨ Today's TV Show Updates ✨\n\n"
+
+2. **Grouping & Condensing:** 
+   - If a TV show appears multiple times with different episodes (e.g., bulk season drops), group them under ONE single numbered entry.
+   - Do NOT repeat the show name or the number for multiple episodes of the same show.
+
+3. **Numbering & Show Titles:** 
+   - Format each unique show as: `[Number]. [Contextual Emoji] [Show Name]`
+   - Dynamically select an emoji that fits the theme or title of the show (e.g., 🩺/🏥 for medical, 🕵️‍♂️/🔍 for crime/mystery, 🐉 for dragons, 🚀 for space, etc.).
+
+4. **Episode Details:** 
+   - On the line below the show title (or stacked lines if multiple episodes), format the season and episode exactly like this: `Season XX, Episode XX - [Date]`
+   - Note: Change the original " - Season XX - Episode XX - " structure into "Season XX, Episode XX - " (using a comma instead of a dash between Season and Episode).
+
+5. **Spacing & Line Breaks:**
+    - Show Title to Episode: Do NOT insert a blank line between the show's title line and its first episode detail line.
+    - Multi-Episode Stacking: When grouping multiple episodes under a single show, stack the episode detail lines directly underneath each other with NO blank lines between them.
+    - Between Separate Entries: Insert exactly one single blank line between the last episode line of the current numbered entry and the title line of the next numbered entry.
+    - Header & Footer Margins: Ensure there is exactly one single blank line separating the header from entry #1, and exactly one single blank line separating the final entry from the footer message.
+
+6. **Footer:** Always end the output with exactly: "\nYou can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿"
+
+Here is an example input and your expected output:
+
+---
+
+INPUT:
+
+Today's Updates:
+
+Human Vapor - Season 01 - Episode 02 - [Jul 03, 2026]
+Human Vapor - Season 01 - Episode 01 - [Jul 03, 2026]
+
+OUTPUT:
+
+✨ Today's TV Show Updates ✨
+
+1. 💨 Human Vapor
+Season 01, Episode 02 - [Jul 03, 2026]
+Season 01, Episode 01 - [Jul 03, 2026]
+
+You can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿
+
+---
+
+Now format this input:
+
+{text}"""
+
 def rewrite(text):
     if not text or not text.strip():
         return "🎬 New update!"
     try:
         r = requests.post(GEMINI_URL, json={
-            "contents": [{"parts": [{"text": f"Rewrite with emojis, keep all info, no intro, under 1000 chars:\n\n{text}\n\nRewritten:"}]}],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}
+            "contents": [{"parts": [{"text": GEMINI_PROMPT.format(text=text)}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
         }, timeout=30)
         r.raise_for_status()
-        out = r.json()['candidates'][0]['content']['parts'][0]['text'].strip().replace('```', '')
-        if not any(ord(c) > 0x1F300 for c in out):
-            out = "🎬 " + out
+        out = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        # Remove any markdown code blocks if Gemini adds them
+        out = out.replace('```', '').strip()
         return out[:4096]
     except Exception as e:
         log.error(f"Gemini error: {e}")
@@ -78,12 +131,11 @@ def save_seen(seen):
         log.error(f"Save error: {e}")
     return False
 
-# ─── SEEN SET (in-memory for speed) ───────────────────────────
+# ─── SEEN SET ───────────────────────────────────────────────────
 seen_ids = load_seen()
 
 # ─── COPY FUNCTION ────────────────────────────────────────────
 async def copy_message(client, msg):
-    """Copy a single message to destination"""
     global seen_ids
     
     if msg.id in seen_ids:
@@ -109,27 +161,23 @@ async def copy_message(client, msg):
     except Exception as e:
         log.error(f"❌ Failed: {e}")
 
-# ─── TELEGRAM CLIENT (runs 24/7) ────────────────────────────────
+# ─── TELEGRAM CLIENT ────────────────────────────────────────────
 async def start_monitoring():
-    """Start Telegram client and listen for new messages"""
     log.info("=" * 50)
-    log.info(f"Starting real-time monitor: @{SOURCE} -> @{DEST}")
+    log.info(f"Monitoring: @{SOURCE} -> @{DEST}")
     
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
     
     @client.on(events.NewMessage(chats=SOURCE))
     async def handler(event):
-        """Triggered INSTANTLY when new message arrives"""
         log.info(f"🔔 New message detected!")
         await copy_message(client, event.message)
     
     await client.start()
-    log.info("✅ Monitoring started! Waiting for new messages...")
-    
-    # Keep running forever
+    log.info("✅ Monitoring started!")
     await client.run_until_disconnected()
 
-# ─── FLASK (keeps Render awake) ───────────────────────────────
+# ─── FLASK ──────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route('/health')
@@ -155,13 +203,11 @@ def home():
 if __name__ == '__main__':
     log.info("🚀 Starting bot...")
     
-    # Start Telegram monitor in background thread
     def run_monitor():
         asyncio.run(start_monitoring())
     
     monitor_thread = threading.Thread(target=run_monitor, daemon=True)
     monitor_thread.start()
     
-    # Start Flask web server (keeps Render alive)
-    log.info(f"Starting web server on port {PORT}")
+    log.info(f"Web server on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, threaded=True)
