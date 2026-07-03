@@ -18,10 +18,12 @@ API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
 SESSION = os.environ['SESSION_STRING']
 GEMINI_KEY = os.environ['GEMINI_API_KEY']
+GITHUB_TOKEN = os.environ['GITHUB_TOKEN']
+GIST_ID = os.environ.get('GIST_ID', '')
+
 SOURCE = os.environ.get('SOURCE_CHANNEL', 'o2tvseries_new')
 DEST = os.environ.get('DEST_CHANNEL', 'NewmovieandSeries0')
 PORT = int(os.environ.get('PORT', 10000))
-STATE_PREFIX = "__BOTSTATE__:"
 
 # ─── GEMINI ─────────────────────────────────────────────────────
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
@@ -43,32 +45,68 @@ def rewrite(text):
         log.error(f"Gemini error: {e}")
         return f"🎬 {text[:4000]}"
 
-# ─── STATE (IN FILE - more reliable than Saved Messages) ───────
-STATE_FILE = '/tmp/bot_state.json'  # /tmp is writable on Render
+# ─── GIST STATE (Persistent across restarts) ──────────────────
+GIST_API = "https://api.github.com/gists"
 
 def load_state():
+    if not GIST_ID or GIST_ID == 'value':
+        log.warning("GIST_ID missing or invalid")
+        return None
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
-                log.info(f"Loaded state from file: last={state.get('last')}, total={state.get('total')}")
-                return state
+        r = requests.get(f"{GIST_API}/{GIST_ID}", 
+                        headers={"Authorization": f"token {GITHUB_TOKEN}"}, 
+                        timeout=15)
+        if r.status_code == 200:
+            content = r.json()['files']['bot_state.json']['content']
+            state = json.loads(content)
+            log.info(f"State loaded: last={state.get('last')}, total={state.get('total')}")
+            return state
+        else:
+            log.error(f"Gist HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        log.error(f"State file load error: {e}")
-    
-    log.info("No state file found. Will create new state.")
+        log.error(f"Gist load failed: {e}")
     return None
 
 def save_state(state):
+    if not GIST_ID or GIST_ID == 'value':
+        log.error("GIST_ID missing, cannot save")
+        return
+    payload = {
+        "description": "Bot state",
+        "public": False,
+        "files": {"bot_state.json": {"content": json.dumps(state, indent=2)}}
+    }
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f)
-        log.info(f"State saved: last={state['last']}, total={state['total']}")
+        r = requests.patch(f"{GIST_API}/{GIST_ID}", json=payload, headers=headers, timeout=15)
+        if r.status_code == 200:
+            log.info(f"State saved: last={state['last']}, total={state['total']}")
+        else:
+            log.error(f"Gist save HTTP {r.status_code}")
     except Exception as e:
-        log.error(f"State save failed: {e}")
+        log.error(f"Gist save failed: {e}")
+
+def create_gist():
+    """Create a new Gist and return its ID"""
+    payload = {
+        "description": "Bot state",
+        "public": False,
+        "files": {"bot_state.json": {"content": json.dumps({"last": 0, "total": 0}, indent=2)}}
+    }
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    try:
+        r = requests.post(GIST_API, json=payload, headers=headers, timeout=15)
+        if r.status_code == 201:
+            new_id = r.json()['id']
+            log.warning(f"NEW GIST CREATED: {new_id}")
+            log.warning("ADD THIS TO RENDER ENV VARS: GIST_ID=" + new_id)
+            return new_id
+    except Exception as e:
+        log.error(f"Gist create failed: {e}")
+    return None
 
 # ─── BOT RUN ────────────────────────────────────────────────────
-async def run_bot_once(force_test=False):
+async def run_bot_once():
     log.info("=" * 50)
     log.info(f"STARTING | Source: @{SOURCE} → Dest: @{DEST}")
     
@@ -92,38 +130,27 @@ async def run_bot_once(force_test=False):
     # Load or init state
     state = load_state()
     if state is None:
-        # First run ever - get latest message ID from source
-        try:
-            latest = await client.get_messages(SOURCE, limit=1)
-            if latest:
-                last_id = latest[0].id
-                log.info(f"First run. Starting from latest message #{last_id}")
-                state = {'last': last_id, 'total': 0}
-                save_state(state)
-            else:
-                log.info("Source channel is empty")
-                await client.disconnect()
-                return "Source channel empty"
-        except Exception as e:
-            log.error(f"Cannot read source: {e}")
+        # Try to create gist if missing
+        global GIST_ID
+        if not GIST_ID or GIST_ID == 'value':
+            new_id = create_gist()
+            if new_id:
+                GIST_ID = new_id
+                # Save to env for next time (won't persist on Render free, but we try)
+                log.warning(f"Set GIST_ID={new_id} in Render env vars and redeploy!")
+        
+        latest = await client.get_messages(SOURCE, limit=1)
+        if latest:
+            last_id = latest[0].id
+            log.info(f"First run. Starting from latest message #{last_id}")
+            state = {'last': last_id, 'total': 0}
+            save_state(state)
+        else:
+            log.info("Source channel is empty")
             await client.disconnect()
-            return f"Source error: {e}"
+            return "Source empty"
     
     last = state.get('last', 0)
-    
-    # FORCE TEST: Post a test message even if no new messages
-    if force_test:
-        log.info("FORCE TEST: Posting test message to destination...")
-        try:
-            test_msg = "🧪 Test message from bot! If you see this, posting works."
-            await client.send_message(DEST, test_msg)
-            log.info("✅ TEST POST SUCCESSFUL")
-            await client.disconnect()
-            return "Test post successful!"
-        except Exception as e:
-            log.error(f"❌ TEST POST FAILED: {e}")
-            await client.disconnect()
-            return f"Test post failed: {e}"
     
     # Fetch messages newer than last
     try:
@@ -135,23 +162,20 @@ async def run_bot_once(force_test=False):
     
     log.info(f"Fetched {len(msgs)} messages with min_id={last}")
     
-    # Debug: Show all fetched message IDs
-    if msgs:
-        ids = [m.id for m in msgs]
-        log.info(f"Message IDs found: {ids}")
-    else:
-        log.info("No messages with id > last_id. This means nothing new was posted.")
-        # Still save state to confirm it works
-        save_state(state)
+    if not msgs:
+        log.info("No new messages")
+        save_state(state)  # Touch state to confirm it works
         await client.disconnect()
         return "No new messages"
+    
+    ids = [m.id for m in msgs]
+    log.info(f"Message IDs found: {ids}")
     
     new_last = last
     copied = 0
     
     for msg in reversed(msgs):
         if msg.id <= last:
-            log.info(f"Skipping msg #{msg.id} (already processed)")
             continue
         
         text = msg.text or msg.raw_text or ""
@@ -175,9 +199,8 @@ async def run_bot_once(force_test=False):
             
         except Exception as e:
             log.error(f"❌ FAILED msg #{msg.id}: {e}")
-            new_last = msg.id  # Still advance to avoid loop
+            new_last = msg.id
     
-    # Save state
     if copied > 0:
         state['last'] = new_last
         state['total'] = state.get('total', 0) + copied
@@ -212,25 +235,9 @@ def manual_run():
     except Exception as e:
         return {"error": str(e), "trace": traceback.format_exc()}, 500
 
-@app.route('/test')
-def test_post():
-    """Force post a test message to verify permissions"""
-    try:
-        result = asyncio.run(run_bot_once(force_test=True))
-        return {"result": result}
-    except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}, 500
-
 @app.route('/')
 def home():
-    return {
-        "bot": "telegram-channel-bot",
-        "endpoints": {
-            "/health": "Auto-run bot (background)",
-            "/run": "Manual run with result",
-            "/test": "Force test post to dest channel"
-        }
-    }
+    return {"bot": "telegram-channel-bot", "endpoints": ["/health", "/run"]}
 
 # ─── MAIN ───────────────────────────────────────────────────────
 if __name__ == '__main__':
