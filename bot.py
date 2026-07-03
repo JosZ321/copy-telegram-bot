@@ -45,77 +45,58 @@ def rewrite(text):
         log.error(f"Gemini error: {e}")
         return f"🎬 {text[:4000]}"
 
-# ─── GIST STATE (Persistent across restarts) ──────────────────
+# ─── GIST STATE (seen message IDs) ─────────────────────────────
 GIST_API = "https://api.github.com/gists"
 
-def load_state():
-    if not GIST_ID or GIST_ID == 'value':
-        log.warning("GIST_ID missing or invalid")
-        return None
+def load_seen():
+    """Load set of seen message IDs from Gist"""
+    if not GIST_ID or GIST_ID in ('', 'value'):
+        log.warning("GIST_ID missing")
+        return set()
     try:
         r = requests.get(f"{GIST_API}/{GIST_ID}", 
                         headers={"Authorization": f"token {GITHUB_TOKEN}"}, 
                         timeout=15)
         if r.status_code == 200:
             content = r.json()['files']['bot_state.json']['content']
-            state = json.loads(content)
-            log.info(f"State loaded: last={state.get('last')}, total={state.get('total')}")
-            return state
-        else:
-            log.error(f"Gist HTTP {r.status_code}: {r.text[:200]}")
+            data = json.loads(content)
+            seen = set(data.get('seen', []))
+            log.info(f"Loaded {len(seen)} seen message IDs")
+            return seen
     except Exception as e:
-        log.error(f"Gist load failed: {e}")
-    return None
+        log.error(f"Load error: {e}")
+    return set()
 
-def save_state(state):
-    if not GIST_ID or GIST_ID == 'value':
-        log.error("GIST_ID missing, cannot save")
-        return
+def save_seen(seen):
+    """Save set of seen message IDs to Gist"""
+    if not GIST_ID or GIST_ID in ('', 'value'):
+        log.error("GIST_ID missing, cannot save!")
+        return False
     payload = {
-        "description": "Bot state",
+        "description": "Bot state - seen message IDs",
         "public": False,
-        "files": {"bot_state.json": {"content": json.dumps(state, indent=2)}}
+        "files": {"bot_state.json": {"content": json.dumps({"seen": sorted(list(seen))}, indent=2)}}
     }
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     try:
         r = requests.patch(f"{GIST_API}/{GIST_ID}", json=payload, headers=headers, timeout=15)
         if r.status_code == 200:
-            log.info(f"State saved: last={state['last']}, total={state['total']}")
-        else:
-            log.error(f"Gist save HTTP {r.status_code}")
+            log.info(f"Saved {len(seen)} seen IDs")
+            return True
     except Exception as e:
-        log.error(f"Gist save failed: {e}")
+        log.error(f"Save error: {e}")
+    return False
 
-def create_gist():
-    """Create a new Gist and return its ID"""
-    payload = {
-        "description": "Bot state",
-        "public": False,
-        "files": {"bot_state.json": {"content": json.dumps({"last": 0, "total": 0}, indent=2)}}
-    }
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    try:
-        r = requests.post(GIST_API, json=payload, headers=headers, timeout=15)
-        if r.status_code == 201:
-            new_id = r.json()['id']
-            log.warning(f"NEW GIST CREATED: {new_id}")
-            log.warning("ADD THIS TO RENDER ENV VARS: GIST_ID=" + new_id)
-            return new_id
-    except Exception as e:
-        log.error(f"Gist create failed: {e}")
-    return None
-
-# ─── BOT RUN ────────────────────────────────────────────────────
-async def run_bot_once():
+# ─── BOT CORE ───────────────────────────────────────────────────
+async def run_bot():
     log.info("=" * 50)
-    log.info(f"STARTING | Source: @{SOURCE} → Dest: @{DEST}")
+    log.info(f"Checking @{SOURCE} -> @{DEST}")
     
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
     try:
         await client.start()
         log.info("Connected to Telegram")
     except Exception as e:
-        log.error(f"Connection failed: {e}")
         return f"Connection failed: {e}"
     
     # Check destination
@@ -123,123 +104,106 @@ async def run_bot_once():
         dest = await client.get_entity(DEST)
         log.info(f"Destination OK: {dest.title}")
     except Exception as e:
-        log.error(f"Destination error: {e}")
         await client.disconnect()
-        return f"Cannot access dest: {e}"
+        return f"Cannot access destination: {e}"
     
-    # Load or init state
-    state = load_state()
-    if state is None:
-        # Try to create gist if missing
-        global GIST_ID
-        if not GIST_ID or GIST_ID == 'value':
-            new_id = create_gist()
-            if new_id:
-                GIST_ID = new_id
-                # Save to env for next time (won't persist on Render free, but we try)
-                log.warning(f"Set GIST_ID={new_id} in Render env vars and redeploy!")
-        
-        latest = await client.get_messages(SOURCE, limit=1)
-        if latest:
-            last_id = latest[0].id
-            log.info(f"First run. Starting from latest message #{last_id}")
-            state = {'last': last_id, 'total': 0}
-            save_state(state)
-        else:
-            log.info("Source channel is empty")
-            await client.disconnect()
-            return "Source empty"
+    # Load seen IDs
+    seen = load_seen()
     
-    last = state.get('last', 0)
-    
-    # Fetch messages newer than last
+    # Get recent messages from source (last 20)
     try:
-        msgs = await client.get_messages(SOURCE, limit=20, min_id=last)
+        msgs = await client.get_messages(SOURCE, limit=20)
     except Exception as e:
-        log.error(f"Fetch failed: {e}")
         await client.disconnect()
-        return f"Fetch failed: {e}"
+        return f"Cannot read source: {e}"
     
-    log.info(f"Fetched {len(msgs)} messages with min_id={last}")
+    log.info(f"Fetched {len(msgs)} recent messages")
     
-    if not msgs:
-        log.info("No new messages")
-        save_state(state)  # Touch state to confirm it works
+    # Find unseen messages
+    unseen = [m for m in msgs if m.id not in seen]
+    log.info(f"Unseen messages: {len(unseen)}")
+    
+    if not unseen:
+        log.info("Nothing new to copy")
         await client.disconnect()
         return "No new messages"
     
-    ids = [m.id for m in msgs]
-    log.info(f"Message IDs found: {ids}")
-    
-    new_last = last
+    # Copy unseen (oldest first)
     copied = 0
-    
-    for msg in reversed(msgs):
-        if msg.id <= last:
-            continue
-        
+    for msg in reversed(unseen):
         text = msg.text or msg.raw_text or ""
-        preview = text[:60].replace('\n', ' ') + "..." if len(text) > 60 else text
-        log.info(f"Processing msg #{msg.id}: {preview}")
+        preview = text[:50].replace('\n', ' ') if text else "(no text)"
+        log.info(f"Copying #{msg.id}: {preview}...")
         
         new_text = rewrite(text) if text else "🎬 New update!"
         
         try:
             if msg.media:
-                log.info(f"Sending with media...")
                 sent = await client.send_file(DEST, file=msg.media, caption=new_text)
             else:
-                log.info(f"Sending text...")
                 sent = await client.send_message(DEST, new_text)
             
+            # Mark as seen ONLY after successful post
+            seen.add(msg.id)
             copied += 1
-            new_last = msg.id
-            log.info(f"✅ POSTED: msg #{msg.id} → new msg #{sent.id}")
+            log.info(f"✅ Posted as #{sent.id}")
             await asyncio.sleep(3)
             
         except Exception as e:
-            log.error(f"❌ FAILED msg #{msg.id}: {e}")
-            new_last = msg.id
+            log.error(f"❌ Failed #{msg.id}: {e}")
+            # Don't mark as seen if failed - retry next time
     
+    # Save updated seen list
     if copied > 0:
-        state['last'] = new_last
-        state['total'] = state.get('total', 0) + copied
-        save_state(state)
-        log.info(f"Run complete: Copied {copied}, Total: {state['total']}")
+        save_seen(seen)
+        log.info(f"Done! Copied {copied} new messages")
     else:
-        log.info("Nothing copied this run")
+        log.info("Nothing copied")
     
     await client.disconnect()
     log.info("=" * 50)
     return f"Copied {copied} messages"
 
-# ─── FLASK ────────────────────────────────────────────────────
+# ─── FLASK ──────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route('/health')
 def health():
-    def background():
+    def bg():
         try:
-            asyncio.run(run_bot_once())
-        except Exception as e:
-            log.error(f"Thread crash: {e}")
+            asyncio.run(run_bot())
+        except:
             log.error(traceback.format_exc())
-    threading.Thread(target=background, daemon=True).start()
+    threading.Thread(target=bg, daemon=True).start()
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 @app.route('/run')
 def manual_run():
     try:
-        result = asyncio.run(run_bot_once())
+        result = asyncio.run(run_bot())
         return {"result": result}
     except Exception as e:
         return {"error": str(e), "trace": traceback.format_exc()}, 500
 
+@app.route('/reset')
+def reset_state():
+    """Clear all seen IDs - will recopy everything"""
+    if save_seen(set()):
+        return {"result": "State cleared. Next run will copy all messages."}
+    return {"error": "Failed to clear state"}, 500
+
 @app.route('/')
 def home():
-    return {"bot": "telegram-channel-bot", "endpoints": ["/health", "/run"]}
+    return {
+        "bot": "telegram-channel-bot",
+        "endpoints": {
+            "/run": "Check and copy new messages",
+            "/reset": "Clear seen list (recopy everything)",
+            "/health": "Auto-check (UptimeRobot)"
+        }
+    }
 
 # ─── MAIN ───────────────────────────────────────────────────────
 if __name__ == '__main__':
-    log.info("🚀 Starting up...")
+    log.info("🚀 Bot starting...")
     app.run(host='0.0.0.0', port=PORT, threaded=True)
