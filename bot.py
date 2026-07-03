@@ -3,11 +3,10 @@ import json
 import asyncio
 import logging
 import threading
-import traceback
 from datetime import datetime
 import requests
 from flask import Flask
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
@@ -45,165 +44,124 @@ def rewrite(text):
         log.error(f"Gemini error: {e}")
         return f"🎬 {text[:4000]}"
 
-# ─── GIST STATE (seen message IDs) ─────────────────────────────
+# ─── GIST STATE ─────────────────────────────────────────────────
 GIST_API = "https://api.github.com/gists"
 
 def load_seen():
-    """Load set of seen message IDs from Gist"""
     if not GIST_ID or GIST_ID in ('', 'value'):
-        log.warning("GIST_ID missing")
         return set()
     try:
         r = requests.get(f"{GIST_API}/{GIST_ID}", 
                         headers={"Authorization": f"token {GITHUB_TOKEN}"}, 
                         timeout=15)
         if r.status_code == 200:
-            content = r.json()['files']['bot_state.json']['content']
-            data = json.loads(content)
-            seen = set(data.get('seen', []))
-            log.info(f"Loaded {len(seen)} seen message IDs")
-            return seen
+            data = json.loads(r.json()['files']['bot_state.json']['content'])
+            return set(data.get('seen', []))
     except Exception as e:
         log.error(f"Load error: {e}")
     return set()
 
 def save_seen(seen):
-    """Save set of seen message IDs to Gist"""
     if not GIST_ID or GIST_ID in ('', 'value'):
-        log.error("GIST_ID missing, cannot save!")
+        log.error("GIST_ID missing!")
         return False
     payload = {
-        "description": "Bot state - seen message IDs",
+        "description": "Bot state",
         "public": False,
         "files": {"bot_state.json": {"content": json.dumps({"seen": sorted(list(seen))}, indent=2)}}
     }
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     try:
         r = requests.patch(f"{GIST_API}/{GIST_ID}", json=payload, headers=headers, timeout=15)
-        if r.status_code == 200:
-            log.info(f"Saved {len(seen)} seen IDs")
-            return True
+        return r.status_code == 200
     except Exception as e:
         log.error(f"Save error: {e}")
     return False
 
-# ─── BOT CORE ───────────────────────────────────────────────────
-async def run_bot():
+# ─── SEEN SET (in-memory for speed) ───────────────────────────
+seen_ids = load_seen()
+
+# ─── COPY FUNCTION ────────────────────────────────────────────
+async def copy_message(client, msg):
+    """Copy a single message to destination"""
+    global seen_ids
+    
+    if msg.id in seen_ids:
+        log.info(f"Skipping #{msg.id} (already seen)")
+        return
+    
+    text = msg.text or msg.raw_text or ""
+    preview = text[:50].replace('\n', ' ') if text else "(no text)"
+    log.info(f"New message #{msg.id}: {preview}")
+    
+    new_text = rewrite(text) if text else "🎬 New update!"
+    
+    try:
+        if msg.media:
+            sent = await client.send_file(DEST, file=msg.media, caption=new_text)
+        else:
+            sent = await client.send_message(DEST, new_text)
+        
+        seen_ids.add(msg.id)
+        save_seen(seen_ids)
+        log.info(f"✅ Copied to #{sent.id}")
+        
+    except Exception as e:
+        log.error(f"❌ Failed: {e}")
+
+# ─── TELEGRAM CLIENT (runs 24/7) ────────────────────────────────
+async def start_monitoring():
+    """Start Telegram client and listen for new messages"""
     log.info("=" * 50)
-    log.info(f"Checking @{SOURCE} -> @{DEST}")
+    log.info(f"Starting real-time monitor: @{SOURCE} -> @{DEST}")
     
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-    try:
-        await client.start()
-        log.info("Connected to Telegram")
-    except Exception as e:
-        return f"Connection failed: {e}"
     
-    # Check destination
-    try:
-        dest = await client.get_entity(DEST)
-        log.info(f"Destination OK: {dest.title}")
-    except Exception as e:
-        await client.disconnect()
-        return f"Cannot access destination: {e}"
+    @client.on(events.NewMessage(chats=SOURCE))
+    async def handler(event):
+        """Triggered INSTANTLY when new message arrives"""
+        log.info(f"🔔 New message detected!")
+        await copy_message(client, event.message)
     
-    # Load seen IDs
-    seen = load_seen()
+    await client.start()
+    log.info("✅ Monitoring started! Waiting for new messages...")
     
-    # Get recent messages from source (last 20)
-    try:
-        msgs = await client.get_messages(SOURCE, limit=20)
-    except Exception as e:
-        await client.disconnect()
-        return f"Cannot read source: {e}"
-    
-    log.info(f"Fetched {len(msgs)} recent messages")
-    
-    # Find unseen messages
-    unseen = [m for m in msgs if m.id not in seen]
-    log.info(f"Unseen messages: {len(unseen)}")
-    
-    if not unseen:
-        log.info("Nothing new to copy")
-        await client.disconnect()
-        return "No new messages"
-    
-    # Copy unseen (oldest first)
-    copied = 0
-    for msg in reversed(unseen):
-        text = msg.text or msg.raw_text or ""
-        preview = text[:50].replace('\n', ' ') if text else "(no text)"
-        log.info(f"Copying #{msg.id}: {preview}...")
-        
-        new_text = rewrite(text) if text else "🎬 New update!"
-        
-        try:
-            if msg.media:
-                sent = await client.send_file(DEST, file=msg.media, caption=new_text)
-            else:
-                sent = await client.send_message(DEST, new_text)
-            
-            # Mark as seen ONLY after successful post
-            seen.add(msg.id)
-            copied += 1
-            log.info(f"✅ Posted as #{sent.id}")
-            await asyncio.sleep(3)
-            
-        except Exception as e:
-            log.error(f"❌ Failed #{msg.id}: {e}")
-            # Don't mark as seen if failed - retry next time
-    
-    # Save updated seen list
-    if copied > 0:
-        save_seen(seen)
-        log.info(f"Done! Copied {copied} new messages")
-    else:
-        log.info("Nothing copied")
-    
-    await client.disconnect()
-    log.info("=" * 50)
-    return f"Copied {copied} messages"
+    # Keep running forever
+    await client.run_until_disconnected()
 
-# ─── FLASK ──────────────────────────────────────────────────────
+# ─── FLASK (keeps Render awake) ───────────────────────────────
 app = Flask(__name__)
 
 @app.route('/health')
 def health():
-    def bg():
-        try:
-            asyncio.run(run_bot())
-        except:
-            log.error(traceback.format_exc())
-    threading.Thread(target=bg, daemon=True).start()
-    return {"status": "ok", "time": datetime.now().isoformat()}
-
-@app.route('/run')
-def manual_run():
-    try:
-        result = asyncio.run(run_bot())
-        return {"result": result}
-    except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}, 500
-
-@app.route('/reset')
-def reset_state():
-    """Clear all seen IDs - will recopy everything"""
-    if save_seen(set()):
-        return {"result": "State cleared. Next run will copy all messages."}
-    return {"error": "Failed to clear state"}, 500
+    return {
+        "status": "ok",
+        "monitoring": True,
+        "seen_count": len(seen_ids),
+        "time": datetime.now().isoformat()
+    }
 
 @app.route('/')
 def home():
     return {
         "bot": "telegram-channel-bot",
-        "endpoints": {
-            "/run": "Check and copy new messages",
-            "/reset": "Clear seen list (recopy everything)",
-            "/health": "Auto-check (UptimeRobot)"
-        }
+        "mode": "real-time monitoring",
+        "source": SOURCE,
+        "dest": DEST,
+        "seen_messages": len(seen_ids)
     }
 
 # ─── MAIN ───────────────────────────────────────────────────────
 if __name__ == '__main__':
-    log.info("🚀 Bot starting...")
+    log.info("🚀 Starting bot...")
+    
+    # Start Telegram monitor in background thread
+    def run_monitor():
+        asyncio.run(start_monitoring())
+    
+    monitor_thread = threading.Thread(target=run_monitor, daemon=True)
+    monitor_thread.start()
+    
+    # Start Flask web server (keeps Render alive)
+    log.info(f"Starting web server on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, threaded=True)
