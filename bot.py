@@ -4,7 +4,6 @@ import asyncio
 import logging
 import threading
 import re
-import time
 from datetime import datetime
 import requests
 from flask import Flask
@@ -26,119 +25,12 @@ SOURCE = os.environ.get('SOURCE_CHANNEL', 'o2tvseries_new')
 DEST = os.environ.get('DEST_CHANNEL', 'NewmovieandSeries0')
 PORT = int(os.environ.get('PORT', 10000))
 
-# ─── GEMINI SETUP ───────────────────────────────────────────────
-GEMINI_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite"]
-
-GEMINI_PROMPT = """You are an expert data-formatting assistant. Your task is to transform a raw, unformatted list of TV show updates into a highly clean, engaging, numbered, and emoji-enhanced list.
-
-Follow these strict formatting rules instructions explicitly:
-
-1. **Header:** Always start the response with exactly: "✨ Today's TV Show Updates ✨\n\n"
-
-2. **Grouping & Condensing:** 
-   - If a TV show appears multiple times with different episodes (e.g., bulk season drops), group them under ONE single numbered entry.
-   - Do NOT repeat the show name or the number for multiple episodes of the same show.
-
-3. **Numbering & Show Titles:** 
-   - Format each unique show as: `[Number]. [Contextual Emoji] [Show Name]`
-   - Dynamically select an emoji that fits the theme or title of the show (e.g., 🩺/🏥 for medical, 🕵️‍♂️/🔍 for crime/mystery, 🐉 for dragons, 🚀 for space, etc.).
-
-4. **Episode Details:** 
-   - On the line below the show title (or stacked lines if multiple episodes), format the season and episode exactly like this: `Season XX, Episode XX - [Date]`
-   - Note: Change the original " - Season XX - Episode XX - " structure into "Season XX, Episode XX - " (using a comma instead of a dash between Season and Episode).
-
-5. **Spacing & Line Breaks:**
-   - Show Title to Episode: Do NOT insert a blank line between the show's title line and its first episode detail line.
-   - Multi-Episode Stacking: When grouping multiple episodes under a single show, stack the episode detail lines directly underneath each other with NO blank lines between them.
-   - Between Separate Entries: Insert exactly one single blank line between the last episode line of the current numbered entry and the title line of the next numbered entry.
-   - Header & Footer Margins: Ensure there is exactly one single blank line separating the header from entry #1, and exactly one single blank line separating the final entry from the footer message.
-
-6. **Footer:** Always end the output with exactly: "\nYou can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿"
-
-Here is an example input and your expected output:
-
----
-
-INPUT:
-
-Today's Updates:
-
-Human Vapor - Season 01 - Episode 02 - [Jul 03, 2026]
-Human Vapor - Season 01 - Episode 01 - [Jul 03, 2026]
-
-OUTPUT:
-
-✨ Today's TV Show Updates ✨
-
-1. 💨 Human Vapor
-Season 01, Episode 02 - [Jul 03, 2026]
-Season 01, Episode 01 - [Jul 03, 2026]
-
-You can download these episodes now from [https://t.me/t4tsaccbot]. Enjoy! 🎬🍿
-
----
-
-Now format this input:
-
-{text}"""
-
-def format_with_gemini(text):
-    """Try multiple Gemini models, return formatted text or None."""
-    payload = {
-        "contents": [{"parts": [{"text": GEMINI_PROMPT.format(text=text)}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
-    }
-    
-    for model in GEMINI_MODELS:
-        url = GEMINI_URL_TEMPLATE.format(model=model, key=GEMINI_KEY)
-        try:
-            log.info(f"Trying {model}...")
-            r = requests.post(url, json=payload, timeout=30)
-            r.raise_for_status()
-            
-            data = r.json()
-            candidates = data.get('candidates', [])
-            if not candidates:
-                continue
-            
-            content = candidates[0].get('content', {})
-            parts = content.get('parts', []) if isinstance(content, dict) else []
-            
-            if parts and isinstance(parts[0], dict):
-                out = parts[0].get('text', '').strip()
-            else:
-                out = str(parts[0]).strip() if parts else ''
-            
-            if out:
-                out = out.replace('```', '').strip()
-                log.info(f"✅ {model} worked")
-                return out
-                
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code
-            if status == 503:
-                log.warning(f"{model} unavailable (503)")
-                continue
-            if status == 429:
-                log.warning(f"{model} rate limited, waiting...")
-                time.sleep(5)
-                continue
-            log.error(f"{model} HTTP {status}")
-            return None
-        except Exception as e:
-            log.error(f"{model} error: {e}")
-            continue
-    
-    log.error("All Gemini models failed")
-    return None
-
 # ─── SMART EMOJI FINDER ─────────────────────────────────────────
 def get_smart_emoji(show_name):
     """Find best emoji for a show name."""
     sl = show_name.lower()
     
-    # Exact matches first
+    # Exact matches first (most specific)
     exact = {
         'avatar - the last airbender': '🌊',
         'the bear': '🐻',
@@ -170,41 +62,55 @@ def get_smart_emoji(show_name):
         'de tattas - de serie': '🇳🇱',
         'sugar': '🍬',
         'silo': '🌾',
+        'zatima': '💖',
+        'the mcbee dynasty - real american cowboys': '🤠',
+        'sugarcreek amish mysteries': '🌾',
+        'staged - deadly deception': '🎭',
+        'pardon the intrusion i am home': '🏠',
+        'morfeusz': '💊',
+        'maximum pleasure guaranteed': '🔞',
+        'marriagetoxin': '💍',
+        'doctor on the edge': '🩺',
+        'bust up': '💥',
+        'the killings at parrish station': '🔪',
+        'the warrior princess and the barbaric king': '⚔️',
+        'welcome to wrexham': '⚽',
+        'avatar - the last airbender': '🌊',
     }
     
     for name, emoji in exact.items():
         if name in sl:
             return emoji
     
-    # Keyword matching
+    # Keyword matching (broader)
     keywords = [
-        (['dragon', 'fantasy', 'magic', 'witch', 'demon', 'vampire', 'werewolf'], '🐉'),
-        (['medical', 'hospital', 'doctor', 'nurse', 'patient', 'surgeon', 'emergency'], '🩺'),
-        (['crime', 'detective', 'murder', 'police', 'fbi', 'cia', 'investigation', 'serial killer'], '🔍'),
-        (['space', 'star', 'alien', 'mars', 'planet', 'galaxy', 'cosmos', 'astronaut'], '🚀'),
-        (['war', 'battle', 'soldier', 'army', 'navy', 'marine', 'combat', 'warrior', 'king', 'queen', 'throne'], '⚔️'),
-        (['comedy', 'funny', 'laugh', 'sitcom', 'humor'], '😂'),
-        (['horror', 'scary', 'ghost', 'zombie', 'haunted', 'evil', 'devil'], '👻'),
+        (['dragon', 'fantasy', 'magic', 'witch', 'demon', 'vampire', 'werewolf', 'rava'], '🐉'),
+        (['medical', 'hospital', 'doctor', 'nurse', 'patient', 'surgeon', 'emergency', 'medic', 'health', 'clinic'], '🩺'),
+        (['crime', 'detective', 'murder', 'police', 'fbi', 'cia', 'investigation', 'serial killer', 'mystery', 'killing', 'kill', 'dead', 'death', 'murdered', 'parrish'], '🔍'),
+        (['space', 'star', 'alien', 'mars', 'planet', 'galaxy', 'cosmos', 'astronaut', 'jupiter'], '🚀'),
+        (['war', 'battle', 'soldier', 'army', 'navy', 'marine', 'combat', 'warrior', 'king', 'queen', 'throne', 'dynasty', 'princess', 'barbaric'], '⚔️'),
+        (['comedy', 'funny', 'laugh', 'sitcom', 'humor', 'comic'], '😂'),
+        (['horror', 'scary', 'ghost', 'zombie', 'haunted', 'evil', 'devil', 'fear', 'terror'], '👻'),
         (['ice', 'snow', 'cold', 'winter', 'frozen', 'arctic', 'antarctica'], '❄️'),
         (['doom', 'dark', 'death', 'apocalypse', 'end of world', 'dystopia'], '💀'),
-        (['agent', 'spy', 'secret', 'mission', 'intelligence', 'covert'], '🕵️'),
-        (['fight', 'martial', 'karate', 'kung', 'boxing', 'mma', 'ufc'], '👊'),
-        (['ranch', 'cowboy', 'west', 'horse', 'frontier', 'outlaw'], '🤠'),
-        (['gate', 'portal', 'dimension', 'parallel', 'time travel'], '🚪'),
-        (['music', 'song', 'band', 'concert', 'singer', 'album', 'rap', 'hip hop'], '🎵'),
-        (['life', 'happiness', 'pursuit', 'reincarnation', 'afterlife', 'rebirth'], '🌟'),
-        (['earth', 'world', 'globe', 'nature', 'environment', 'climate'], '🌍'),
-        (['proud', 'pride', 'honor', 'glory', 'champion', 'victory'], '🏆'),
-        (['city', 'urban', 'metro', 'downtown', 'street', 'gang'], '🏙️'),
+        (['agent', 'spy', 'secret', 'mission', 'intelligence', 'covert', 'cia', 'fbi', 'ninja'], '🕵️'),
+        (['fight', 'martial', 'karate', 'kung', 'boxing', 'mma', 'ufc', 'fist', 'punch', 'star', 'hokuto'], '👊'),
+        (['ranch', 'cowboy', 'west', 'horse', 'frontier', 'outlaw', 'cowboys', 'mcbee'], '🤠'),
+        (['gate', 'portal', 'dimension', 'parallel', 'time travel', 'beyond'], '🚪'),
+        (['music', 'song', 'band', 'concert', 'singer', 'album', 'rap', 'hip hop', 'note', 'row'], '🎵'),
+        (['life', 'happiness', 'pursuit', 'reincarnation', 'afterlife', 'rebirth', 'living'], '🌟'),
+        (['earth', 'world', 'globe', 'nature', 'environment', 'climate', 'planet', 'snowball'], '🌍'),
+        (['proud', 'pride', 'honor', 'glory', 'champion', 'victory', 'win'], '🏆'),
+        (['city', 'urban', 'metro', 'downtown', 'street', 'gang', 'chi'], '🏙️'),
         (['castle', 'fortress', 'rampart', 'kingdom', 'empire', 'medieval'], '🏰'),
         (['ninja', 'samurai', 'japan', 'shogun', 'ronin', 'dojo'], '🥷'),
         (['cat', 'kitten', 'feline', 'meow', 'purr'], '🐱'),
         (['dog', 'puppy', 'canine', 'woof', 'bark'], '🐶'),
-        (['family', 'parent', 'child', 'kids', 'mother', 'father'], '👨‍👩‍👧‍👦'),
-        (['food', 'cook', 'chef', 'restaurant', 'kitchen', 'recipe'], '🍳'),
-        (['sport', 'football', 'soccer', 'basketball', 'baseball', 'team'], '⚽'),
+        (['family', 'parent', 'child', 'kids', 'mother', 'father', 'dynasty', 'home', 'intrusion'], '👨‍👩‍👧‍👦'),
+        (['food', 'cook', 'chef', 'restaurant', 'kitchen', 'recipe', 'sugar', 'sugarcreek', 'amish'], '🍳'),
+        (['sport', 'football', 'soccer', 'basketball', 'baseball', 'team', 'wrexham'], '⚽'),
         (['school', 'student', 'teacher', 'class', 'university', 'college'], '🎓'),
-        (['money', 'rich', 'wealth', 'billionaire', 'business', 'corporate'], '💰'),
+        (['money', 'rich', 'wealth', 'billionaire', 'business', 'corporate', 'maximum', 'pleasure'], '💰'),
         (['car', 'drive', 'race', 'motor', 'speed', 'highway'], '🏎️'),
         (['plane', 'fly', 'airport', 'pilot', 'flight', 'travel'], '✈️'),
         (['boat', 'ship', 'sea', 'ocean', 'sail', 'cruise', 'navy'], '⚓'),
@@ -222,7 +128,47 @@ def get_smart_emoji(show_name):
         (['angel', 'heaven', 'guardian', 'wings', 'divine'], '👼'),
         (['devil', 'hell', 'demon', 'satan', 'possession'], '😈'),
         (['circus', 'clown', 'carnival', 'freak', 'performance'], '🎪'),
-        (['circus', 'clown', 'carnival', 'freak', 'performance'], '🎪'),
+        (['amish', 'country', 'rural', 'farm', 'barn'], '🌾'),
+        (['home', 'house', 'intrusion', 'family', 'domestic'], '🏠'),
+        (['stage', 'act', 'theater', 'play', 'performance', 'deception'], '🎭'),
+        (['marriage', 'wedding', 'bride', 'groom', 'divorce', 'toxin'], '💍'),
+        (['doctor', 'medic', 'hospital', 'clinic', 'surgery', 'edge'], '🩺'),
+        (['bust', 'explosion', 'break', 'destroy', 'crash'], '💥'),
+        (['pleasure', 'desire', 'passion', 'romance', 'adult'], '🔞'),
+        (['edge', 'cliff', 'danger', 'risk', 'extreme'], '⚠️'),
+        (['parrish', 'station', 'train', 'railway', 'subway'], '🚉'),
+        (['vapor', 'steam', 'mist', 'fog'], '💨'),
+        (['doom', 'doomies', 'dark', 'evil'], '💀'),
+        (['snoopy', 'peanuts', 'beagle', 'dog'], '🏕️'),
+        (['wrexham', 'football', 'soccer', 'sport'], '⚽'),
+        (['avatar', 'bender', 'element', 'air', 'water', 'fire', 'earth'], '🌊'),
+        (['bear', 'restaurant', 'chef', 'cook', 'kitchen'], '🐻'),
+        (['island', 'love', 'dating', 'romance', 'paradise'], '💕'),
+        (['kanan', 'power', 'book', 'drug', 'cartel', 'gang'], '👑'),
+        (['hokuto', 'ken', 'fist', 'north', 'star'], '👊'),
+        (['jones', 'jupiter', 'space', 'planet'], '🪐'),
+        (['minds', 'brain', 'smart', 'intelligent', 'genius'], '🧠'),
+        (['fear', 'shark', 'ocean', 'sea'], '🦈'),
+        (['reincarnation', 'petal', 'flower', 'bloom', 'rebirth'], '🌸'),
+        (['rampart', 'ice', 'wall', 'fortress', 'castle'], '🏰'),
+        (['proud', 'pride', 'honor', 'glory'], '🏆'),
+        (['dutton', 'ranch', 'cowboy', 'west', 'yellowstone'], '🤠'),
+        (['kim', 'agent', 'spy', 'reactivate', 'mission'], '🕵️'),
+        (['larry', 'life', 'unhappiness', 'pursuit', 'happiness'], '😔'),
+        (['chain', 'smoke', 'cat', 'feline'], '🐱'),
+        (['tattas', 'dutch', 'netherlands', 'holland'], '🇳🇱'),
+        (['silo', 'underground', 'bunker', 'post-apocalyptic'], '🌾'),
+        (['zatima', 'zeke', 'fatima', 'love', 'relationship'], '💖'),
+        (['sugarcreek', 'amish', 'mystery', 'murder'], '🌾'),
+        (['staged', 'deception', 'fake', 'lie', 'trick'], '🎭'),
+        (['pardon', 'intrusion', 'home', 'house', 'family'], '🏠'),
+        (['morfeusz', 'dream', 'sleep', 'pill', 'drug'], '💊'),
+        (['maximum', 'pleasure', 'guarantee', 'adult'], '🔞'),
+        (['marriagetoxin', 'marriage', 'wedding', 'poison'], '💍'),
+        (['doctor', 'edge', 'hospital', 'medic'], '🩺'),
+        (['bust', 'up', 'explosion', 'break'], '💥'),
+        (['killings', 'parrish', 'station', 'murder'], '🔪'),
+        (['warrior', 'princess', 'barbaric', 'king', 'fantasy'], '⚔️'),
     ]
     
     for words, emoji in keywords:
@@ -249,10 +195,32 @@ def parse_episodes(text):
             })
     return episodes
 
-# ─── PYTHON FALLBACK FORMATTER ─────────────────────────────────
-def python_format(shows, show_order):
-    """Format shows using Python (no Gemini needed). Smart emojis included."""
-    lines = ["✨ Today's TV Show Updates ✨", ""]
+# ─── FORMATTER ──────────────────────────────────────────────────
+def rewrite(text):
+    """Format TV show list using pure Python. Reliable, no truncation."""
+    if not text or not text.strip():
+        return "🎬 New update!"
+    
+    episodes = parse_episodes(text)
+    if not episodes:
+        return "🎬 New update!"
+    
+    # Group by show (preserve first appearance order)
+    shows = {}
+    show_order = []
+    for ep in episodes:
+        show = ep['show']
+        if show not in shows:
+            shows[show] = []
+            show_order.append(show)
+        shows[show].append(ep)
+    
+    # Sort episodes within each show
+    for show in shows:
+        shows[show].sort(key=lambda x: (int(x['season']), int(x['episode'])))
+    
+    # Build output
+    lines = ["✨ Today\'s TV Show Updates ✨", ""]
     
     for i, show in enumerate(show_order, 1):
         emoji = get_smart_emoji(show)
@@ -272,48 +240,58 @@ def python_format(shows, show_order):
     
     return '\n'.join(lines)
 
-# ─── MAIN REWRITE ───────────────────────────────────────────────
-def rewrite(text):
-    """Format TV show list. Try Gemini first, fallback to Python."""
-    if not text or not text.strip():
-        return "🎬 New update!"
+# ─── TELEGRAM SPLITTER ─────────────────────────────────────────
+def split_for_telegram(text, max_len=4000):
+    """Split text into chunks that fit Telegram's limit.
+    Never split in the middle of a show entry."""
+    lines = text.split('\n')
     
-    episodes = parse_episodes(text)
-    if not episodes:
-        return "🎬 New update!"
+    # Extract header
+    header_lines = []
+    while lines and ('✨' in lines[0] or lines[0].strip() == ''):
+        header_lines.append(lines.pop(0))
     
-    # Group by show
-    shows = {}
-    show_order = []
-    for ep in episodes:
-        show = ep['show']
-        if show not in shows:
-            shows[show] = []
-            show_order.append(show)
-        shows[show].append(ep)
+    # Extract footer
+    footer_lines = []
+    while lines and lines[-1].strip() != '':
+        footer_lines.insert(0, lines.pop())
     
-    # Sort episodes within each show
-    for show in shows:
-        shows[show].sort(key=lambda x: (int(x['season']), int(x['episode'])))
+    # Group into show entries
+    entries = []
+    current_entry = []
+    for line in lines:
+        if line.strip() == '':
+            if current_entry:
+                entries.append(current_entry)
+                current_entry = []
+        else:
+            current_entry.append(line)
+    if current_entry:
+        entries.append(current_entry)
     
-    # Try Gemini first (for best emojis and formatting)
-    # Only use Gemini for small lists (under 15 shows) to avoid token limits
-    if len(show_order) <= 15:
-        # Build full input
-        input_lines = ["Today's Updates:", ""]
-        for show in show_order:
-            for ep in shows[show]:
-                input_lines.append(f"{show} - Season {ep['season']} - Episode {ep['episode']} - {ep['date']}")
+    # Build chunks
+    chunks = []
+    current = list(header_lines)
+    
+    for entry in entries:
+        entry_text = '\n'.join(entry) + '\n\n'
+        current_text = '\n'.join(current)
         
-        gemini_result = format_with_gemini('\n'.join(input_lines))
-        
-        if gemini_result:
-            log.info("✅ Used Gemini formatting")
-            return gemini_result
+        if len(current_text) + len(entry_text) > max_len and current:
+            # Finish current chunk
+            chunks.append('\n'.join(current).strip())
+            # Start new chunk
+            current = ["✨ Today\'s TV Show Updates ✨ (continued)", ""] + entry
+        else:
+            current.extend(entry)
+            current.append('')
     
-    # Fallback: Python formatting with smart emojis
-    log.info("Using Python fallback with smart emojis")
-    return python_format(shows, show_order)
+    # Add footer to last chunk
+    if current:
+        current.extend(footer_lines)
+        chunks.append('\n'.join(current).strip())
+    
+    return chunks
 
 # ─── GIST STATE ─────────────────────────────────────────────────
 GIST_API = "https://api.github.com/gists"
@@ -367,40 +345,25 @@ async def copy_message(client, msg):
     new_text = rewrite(text) if text else "🎬 New update!"
     
     try:
-        # Split into Telegram chunks (4096 limit)
-        MAX_LEN = 4000
-        if len(new_text) > MAX_LEN:
-            log.info(f"Output is {len(new_text)} chars, splitting...")
-            chunks = []
-            current = ""
-            for line in new_text.split('\n'):
-                if len(current) + len(line) + 1 > MAX_LEN:
-                    chunks.append(current.strip())
-                    current = line + '\n'
-                else:
-                    current += line + '\n'
-            if current.strip():
-                chunks.append(current.strip())
-            
-            # Send first chunk with media if present
-            first = chunks[0]
-            if msg.media:
-                sent = await client.send_file(DEST, file=msg.media, caption=first)
-            else:
-                sent = await client.send_message(DEST, first)
-            
-            # Send remaining chunks
-            for chunk in chunks[1:]:
-                await client.send_message(DEST, chunk)
-                await asyncio.sleep(2)
-            
-            log.info(f"✅ Sent in {len(chunks)} parts")
+        # Use smart splitter
+        chunks = split_for_telegram(new_text, max_len=4000)
+        
+        if len(chunks) > 1:
+            log.info(f"Split into {len(chunks)} Telegram messages")
+        
+        # Send first chunk with media if present
+        first = chunks[0]
+        if msg.media:
+            sent = await client.send_file(DEST, file=msg.media, caption=first)
         else:
-            if msg.media:
-                sent = await client.send_file(DEST, file=msg.media, caption=new_text)
-            else:
-                sent = await client.send_message(DEST, new_text)
-            log.info(f"✅ Copied to #{sent.id}")
+            sent = await client.send_message(DEST, first)
+        
+        # Send remaining chunks
+        for chunk in chunks[1:]:
+            await client.send_message(DEST, chunk)
+            await asyncio.sleep(2)
+        
+        log.info(f"✅ Sent {len(chunks)} message(s)")
         
         seen_ids.add(msg.id)
         save_seen(seen_ids)
